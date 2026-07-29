@@ -34,7 +34,7 @@ Each task is seeded for reproducibility. The target word is randomly selected fr
 
 ## Reward Structure
 
-This is a sparse reward environment with binary scoring. The agent receives a reward of 1.0 for correctly guessing the target word within the allowed number of turns, and 0.0 otherwise. Rewards are mapped from TextArena's native range of {-1, 0, 1} to {0.0, 0.5, 1.0} via `(raw + 1) / 2`.
+This is a sparse reward environment. TextArena's Wordle reward is already in `[0.0, 1.0]` and is passed through unchanged: guessing the target word scores `1.0`, and every other terminal outcome (running out of guesses or an invalid guess) scores a continuous completion fraction based on how close the final guess was. Intermediate guesses score `0.0`.
 
 We do not use LLM graders for this environment; reward is determined programmatically by exact match against the target word.
 
