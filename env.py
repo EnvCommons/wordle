@@ -1,26 +1,36 @@
 import asyncio
-import textarena as ta
+import json
 import re
-import nltk
+from pathlib import Path
 from typing import List, Tuple
+
+import nltk
+import textarena as ta
 from pydantic import BaseModel
 from openreward.environments import Environment, JSONObject, ToolOutput, TextBlock, tool
 
 
-# TextArena's Wordle constructs an EnglishDictionary on every ta.make(), and that
-# constructor calls nltk.download("words") unconditionally. Even when the corpus is
-# already present, nltk.download does a live network round-trip to the nltk server
-# to check for a newer version. The env-server runs on a single asyncio event loop,
-# so that blocking network call stalls *every* in-flight session on the pod at once;
-# under RL concurrency /ping, /prompt and /delete all blow past the proxy's 10s
-# timeout and surface as a storm of 502s. Ensure the datasets TextArena needs are
-# present once at import, then make nltk.download a no-op so per-session env
-# construction never touches the network again.
+# --- Keep per-session work off the request hot path ------------------------
 #
-# NB: the no-op neuters *all* nltk.download calls, so every dataset TextArena's
-# Wordle relies on must be pre-ensured here: the "words" corpus and the
-# "averaged_perceptron_tagger_eng" tagger (used by pos_tag when filtering the
-# word list).
+# The env-server runs on a single asyncio event loop and constructs the env
+# synchronously inside /create, so anything expensive in WordleEnvironment.__init__
+# (i.e. ta.make()) stalls every other in-flight session on the pod. Under an RL
+# run's concurrency that starves /ping, /prompt and /delete past the proxy's 10s
+# timeout and surfaces as a storm of 502s. Two costs live on that path:
+#
+# 1. Word-list rebuild (the dominant cost). TextArena's WordleEnv runs nltk pos_tag
+#    over the whole dictionary on every construction — the full ~200k-word "en" list
+#    for the hardcore variants — to keep only nouns of the right length. The result
+#    is fully determined by (hardcore, word_length), so we compute it once at image
+#    build time (build_wordlists.py) and load it here, replacing _load_word_list
+#    with a cache lookup. A missing cache (e.g. a local run of an unbuilt checkout)
+#    falls back to recomputing so behaviour is never silently wrong.
+#
+# 2. nltk.download foot-gun. EnglishDictionary calls nltk.download("words")
+#    unconditionally on every construction; even when the data is present the call
+#    does a local status check (and, at most hourly per process, a ~20KB index
+#    fetch) and prints to the log. Ensure the datasets once, then make download a
+#    no-op. The no-op is blanket, so every dataset must be pre-ensured first.
 _NLTK_REQUIREMENTS = (
     ("corpora/words", "words"),
     ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
@@ -35,7 +45,32 @@ def _ensure_nltk_data() -> None:
             nltk.download(package)
 
 
+# Ensure the corpora before importing the Wordle env module: its import-time guards
+# and EnglishDictionary construction both need the data present.
 _ensure_nltk_data()
+
+from textarena.envs.Wordle.env import WordleEnv  # noqa: E402
+
+_WORDLIST_CACHE_PATH = Path(__file__).with_name("wordlists.json")
+try:
+    _WORDLIST_CACHE = json.loads(_WORDLIST_CACHE_PATH.read_text())
+except FileNotFoundError:
+    _WORDLIST_CACHE = {}
+
+_original_load_word_list = WordleEnv._load_word_list
+
+
+def _load_word_list_from_cache(self, hardcore: bool = False) -> None:
+    key = f"{int(bool(hardcore))}:{self.word_length}"
+    cached = _WORDLIST_CACHE.get(key)
+    if cached is None:
+        _original_load_word_list(self, hardcore=hardcore)
+        return
+    self.word_list = list(cached)
+
+
+WordleEnv._load_word_list = _load_word_list_from_cache
+
 nltk.download = lambda *args, **kwargs: True
 
 

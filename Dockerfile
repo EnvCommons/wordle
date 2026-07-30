@@ -15,6 +15,11 @@ RUN python -c "import nltk; [nltk.download(p, download_dir='/usr/share/nltk_data
 
 COPY . /app/
 
+# Precompute the Wordle word lists (the expensive nltk pos_tag pass) once, at
+# build time, so it never runs on the per-session request path. Writes
+# wordlists.json into the image, which env.py loads at runtime.
+RUN python build_wordlists.py
+
 EXPOSE 8000
 
 CMD ["python", "server.py"]
