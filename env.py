@@ -1,8 +1,42 @@
+import asyncio
 import textarena as ta
 import re
+import nltk
 from typing import List, Tuple
 from pydantic import BaseModel
 from openreward.environments import Environment, JSONObject, ToolOutput, TextBlock, tool
+
+
+# TextArena's Wordle constructs an EnglishDictionary on every ta.make(), and that
+# constructor calls nltk.download("words") unconditionally. Even when the corpus is
+# already present, nltk.download does a live network round-trip to the nltk server
+# to check for a newer version. The env-server runs on a single asyncio event loop,
+# so that blocking network call stalls *every* in-flight session on the pod at once;
+# under RL concurrency /ping, /prompt and /delete all blow past the proxy's 10s
+# timeout and surface as a storm of 502s. Ensure the datasets TextArena needs are
+# present once at import, then make nltk.download a no-op so per-session env
+# construction never touches the network again.
+#
+# NB: the no-op neuters *all* nltk.download calls, so every dataset TextArena's
+# Wordle relies on must be pre-ensured here: the "words" corpus and the
+# "averaged_perceptron_tagger_eng" tagger (used by pos_tag when filtering the
+# word list).
+_NLTK_REQUIREMENTS = (
+    ("corpora/words", "words"),
+    ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+)
+
+
+def _ensure_nltk_data() -> None:
+    for find_path, package in _NLTK_REQUIREMENTS:
+        try:
+            nltk.data.find(find_path)
+        except LookupError:
+            nltk.download(package)
+
+
+_ensure_nltk_data()
+nltk.download = lambda *args, **kwargs: True
 
 
 class TaskSpec(BaseModel):
@@ -70,7 +104,9 @@ class WordleEnvironment(Environment):
         return str(observation)
 
     async def get_prompt(self) -> List[TextBlock]:
-        self.ta_env.reset(num_players=1, seed=self.config.seed)
+        # reset()/step()/close() are synchronous TextArena calls; run them off the
+        # event loop so they can't stall other sessions sharing this pod's loop.
+        await asyncio.to_thread(self.ta_env.reset, num_players=1, seed=self.config.seed)
         _, observation = self.ta_env.get_observation()
         obs_text = self._format_observation(observation)
         prompt = (
@@ -96,12 +132,12 @@ class WordleEnvironment(Environment):
             )
 
         action = f"[{params.word}]"
-        done, info = self.ta_env.step(action=action)
+        done, info = await asyncio.to_thread(self.ta_env.step, action=action)
         self.turn_count += 1
 
         if done:
             self.game_done = True
-            rewards, game_info = self.ta_env.close()
+            rewards, game_info = await asyncio.to_thread(self.ta_env.close)
             # TextArena's Wordle already returns a reward in [0, 1] (1.0 on a
             # correct guess, otherwise a continuous completion fraction), so
             # pass it through unchanged rather than remapping an already-
